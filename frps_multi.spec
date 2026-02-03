@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['frp_python\\frps_multi.py'],
+    ['frps_multi.py'],
     pathex=[],
     binaries=[],
     datas=[],

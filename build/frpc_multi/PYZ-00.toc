@@ -1,4 +1,4 @@
-('F:\\frp-python-new\\build\\frpc_multi\\PYZ-00.pyz',
+('F:\\frp-python-new\\frp_python\\build\\frpc_multi\\PYZ-00.pyz',
  [('__future__',
    'C:\\Users\\Wangj\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\__future__.py',
    'PYMODULE'),

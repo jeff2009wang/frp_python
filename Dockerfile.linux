@@ -8,9 +8,9 @@ RUN apt-get update && \
 
 RUN pip install pyinstaller
 
-COPY frp_python /build/frp_python
+COPY . /build/
 
-RUN pyinstaller --onefile --name frpc_multi --distpath dist/linux frp_python/frpc_multi.py && \
-    pyinstaller --onefile --name frps_multi --distpath dist/linux frp_python/frps_multi.py
+RUN pyinstaller --onefile --name frpc_multi --distpath dist/linux ./frpc_multi.py && \
+    pyinstaller --onefile --name frps_multi --distpath dist/linux ./frps_multi.py
 
 CMD ["bash"]
