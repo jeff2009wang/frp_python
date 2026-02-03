@@ -12,6 +12,9 @@ CONFIG_DIR="/etc/pfrp"
 SERVICE_DIR="/etc/systemd/system"
 LOG_DIR="/var/log/pfrp"
 
+INSTALL_MODE=""
+USE_MIRROR=""
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -70,6 +73,15 @@ detect_arch() {
     print_success "Detected architecture: $ARCH ($BINARY_ARCH)"
 }
 
+get_download_url() {
+    local file=$1
+    if [ "$USE_MIRROR" = "true" ]; then
+        echo "https://gh-proxy.com/${RAW_BASE}/dist/linux/${file}"
+    else
+        echo "https://github.com/${REPO}/raw/main/dist/linux/${file}"
+    fi
+}
+
 install_client() {
     print_info "Installing PFRP Client..."
     
@@ -78,10 +90,27 @@ install_client() {
     mkdir -p pfrp_install
     cd pfrp_install
     
-    print_info "Downloading frpc_multi from GitHub..."
-    wget -q --show-progress "https://github.com/${REPO}/raw/main/dist/linux/frpc_multi" -O frpc_multi || {
+    local download_url=$(get_download_url "frpc_multi")
+    
+    if [ "$USE_MIRROR" = "true" ]; then
+        print_info "Downloading frpc_multi from GitHub mirror (accelerated)..."
+    else
+        print_info "Downloading frpc_multi from GitHub..."
+    fi
+    
+    wget -q --show-progress "${download_url}" -O frpc_multi || {
         print_error "Failed to download frpc_multi"
-        exit 1
+        if [ "$USE_MIRROR" != "true" ]; then
+            print_warning "Retrying with mirror..."
+            USE_MIRROR="true"
+            download_url=$(get_download_url "frpc_multi")
+            wget -q --show-progress "${download_url}" -O frpc_multi || {
+                print_error "Failed to download from mirror as well"
+                exit 1
+            }
+        else
+            exit 1
+        fi
     }
     
     chmod +x frpc_multi
@@ -102,10 +131,27 @@ install_server() {
     mkdir -p pfrp_install
     cd pfrp_install
     
-    print_info "Downloading frps_multi from GitHub..."
-    wget -q --show-progress "https://github.com/${REPO}/raw/main/dist/linux/frps_multi" -O frps_multi || {
+    local download_url=$(get_download_url "frps_multi")
+    
+    if [ "$USE_MIRROR" = "true" ]; then
+        print_info "Downloading frps_multi from GitHub mirror (accelerated)..."
+    else
+        print_info "Downloading frps_multi from GitHub..."
+    fi
+    
+    wget -q --show-progress "${download_url}" -O frps_multi || {
         print_error "Failed to download frps_multi"
-        exit 1
+        if [ "$USE_MIRROR" != "true" ]; then
+            print_warning "Retrying with mirror..."
+            USE_MIRROR="true"
+            download_url=$(get_download_url "frps_multi")
+            wget -q --show-progress "${download_url}" -O frps_multi || {
+                print_error "Failed to download from mirror as well"
+                exit 1
+            }
+        else
+            exit 1
+        fi
     }
     
     chmod +x frps_multi
@@ -468,7 +514,54 @@ uninstall() {
     print_success "PFRP uninstalled successfully"
 }
 
+show_usage() {
+    cat << EOF
+Usage: $0 [OPTION]
+
+PFRP Installer - Install PFRP Client/Server
+
+Options:
+  --client           Install PFRP Client only
+  --server           Install PFRP Server only
+  --both             Install both Client and Server
+  --uninstall        Uninstall PFRP
+  --mirror           Use GitHub mirror for faster download in China
+  -h, --help         Show this help message
+
+If no option is provided, interactive mode will be started.
+
+Examples:
+  sudo $0 --client          Install client only
+  sudo $0 --server          Install server only
+  sudo $0 --both            Install both client and server
+  sudo $0 --server --mirror Install server with mirror (recommended in China)
+  sudo $0 --uninstall       Uninstall PFRP
+
+EOF
+}
+
 main_menu() {
+    if [ -n "$INSTALL_MODE" ]; then
+        case $INSTALL_MODE in
+            client)
+                install_client
+                ;;
+            server)
+                install_server
+                ;;
+            both)
+                install_client
+                echo ""
+                print_info "Installing server..."
+                install_server
+                ;;
+            uninstall)
+                uninstall
+                ;;
+        esac
+        return
+    fi
+    
     print_header
     
     echo "Please select an option:"
@@ -515,6 +608,42 @@ main() {
     mkdir -p ${CONFIG_DIR}
     
     detect_arch
+    
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --client)
+                INSTALL_MODE="client"
+                shift
+                ;;
+            --server)
+                INSTALL_MODE="server"
+                shift
+                ;;
+            --both)
+                INSTALL_MODE="both"
+                shift
+                ;;
+            --uninstall)
+                INSTALL_MODE="uninstall"
+                shift
+                ;;
+            --mirror)
+                USE_MIRROR="true"
+                print_info "GitHub mirror enabled for faster download in China"
+                shift
+                ;;
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            *)
+                echo "Error: Unknown option '$1'"
+                echo ""
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
     
     main_menu
 }

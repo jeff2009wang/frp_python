@@ -27,6 +27,9 @@ CMD_REGISTER_PORT = 2
 CMD_UNREGISTER_PORT = 3
 CMD_CONNECTION = 4
 CMD_CONNECTION_ACK = 5
+CMD_REGISTER_UDP_PORT = 6
+CMD_UNREGISTER_UDP_PORT = 7
+CMD_UDP_DATA = 8
 
 # Frame: [StreamID:4][Length:4][Data:N]
 FRAME_HEADER_SIZE = 8
@@ -105,10 +108,20 @@ class DataChannel:
         self.DRAIN_INTERVAL = 0.01  # Or every 10ms
     
     async def send(self, stream_id: int, data: bytes):
-        """Send data - rely completely on OS buffering for max throughput."""
+        """Send TCP data."""
         header = struct.pack('!II', stream_id, len(data))
         self.writer.write(header + data)
         self.bytes_sent += len(data)
+        await self.writer.drain()
+
+    async def send_udp(self, payload: bytes):
+        """Send UDP data encapsulated in CMD_UDP_DATA."""
+        # Use stream_id 0 to indicate control/non-TCP-stream data in the data channel if needed, 
+        # but here we follow the framing: [StreamID:4][Length:4][Data:N]
+        # For UDP, we can use a special StreamID (e.g. 0xFFFFFFFF) or just wrap it in CMD_UDP_DATA
+        # Let's use StreamID 0 for UDP/Special data within the data channel.
+        header = struct.pack('!II', 0, len(payload) + 1)
+        self.writer.write(header + struct.pack('!B', CMD_UDP_DATA) + payload)
         await self.writer.drain()
     
     async def flush(self):
@@ -127,6 +140,7 @@ class FrpsMultiProtocol:
         self.control_writer: Optional[asyncio.StreamWriter] = None
         self.data_channels: List[DataChannel] = []
         self.port_listeners: Dict[int, 'PortListener'] = {}
+        self.udp_listeners: Dict[int, 'UDPListener'] = {}
         self.stream_to_user: Dict[int, asyncio.StreamWriter] = {}
         self.stream_to_channel: Dict[int, DataChannel] = {}
         self.stream_ready: Set[int] = set()
@@ -144,12 +158,15 @@ class FrpsMultiProtocol:
     
     async def handle_control(self):
         """Handle control channel messages."""
+        logger.info("Control loop started")
         try:
             while self._running:
                 # Read control frame: [Cmd:1][Length:4][Data:N]
                 header = await self.control_reader.readexactly(5)
                 cmd, length = struct.unpack('!BI', header)
                 data = await self.control_reader.readexactly(length) if length > 0 else b''
+                
+                logger.debug(f"Control command received: cmd={cmd}, len={length}")
                 
                 if cmd == CMD_HEARTBEAT:
                     # Echo back the timestamp for RTT calculation
@@ -159,6 +176,12 @@ class FrpsMultiProtocol:
                     await self._handle_register_port(data)
                 elif cmd == CMD_UNREGISTER_PORT:
                     await self._handle_unregister_port(data)
+                elif cmd == CMD_REGISTER_UDP_PORT:
+                    await self._handle_register_udp_port(data)
+                elif cmd == CMD_UNREGISTER_UDP_PORT:
+                    await self._handle_unregister_udp_port(data)
+                elif cmd == CMD_UDP_DATA:
+                    await self._handle_udp_data(data)
                 elif cmd == CMD_CONNECTION_ACK:
                     stream_id = struct.unpack('!I', data)[0]
                     self.stream_ready.add(stream_id)
@@ -184,8 +207,12 @@ class FrpsMultiProtocol:
                 perf_stats.add_read_time(t1 - t0)
                 perf_stats.add_recv(len(data))
                 
+                if stream_id == 0:
+                    # Special data (UDP or Control)
+                    if data.startswith(struct.pack('!B', CMD_UDP_DATA)):
+                        await self._handle_udp_data(data[1:])
                 # Forward to user connection
-                if stream_id in self.stream_to_user:
+                elif stream_id in self.stream_to_user:
                     writer = self.stream_to_user[stream_id]
                     t2 = time.time()
                     writer.write(data)
@@ -202,11 +229,60 @@ class FrpsMultiProtocol:
         finally:
             channel.close()
     
+    async def _handle_register_udp_port(self, data: bytes):
+        port = struct.unpack('!I', data)[0]
+        if port in self.udp_listeners:
+            logger.info(f'UDP Port {port} already registered')
+            self.control_writer.write(struct.pack('!BII', CMD_REGISTER_UDP_PORT, 4, port))
+            await self.control_writer.drain()
+            return
+
+        try:
+            listener = UDPListener(port, self)
+            transport, protocol = await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: listener, local_addr=('0.0.0.0', port)
+            )
+            listener.transport = transport
+            self.udp_listeners[port] = listener
+            
+            self.control_writer.write(struct.pack('!BII', CMD_REGISTER_UDP_PORT, 4, port))
+            await self.control_writer.drain()
+            logger.info(f'UDP Port {port} registered')
+        except Exception as e:
+            logger.error(f'Failed to register UDP port {port}: {e}')
+            self.control_writer.write(struct.pack('!BII', CMD_REGISTER_UDP_PORT, 4, 0))
+            await self.control_writer.drain()
+
+    async def _handle_unregister_udp_port(self, data: bytes):
+        port = struct.unpack('!I', data)[0]
+        if port in self.udp_listeners:
+            self.udp_listeners[port].stop()
+            del self.udp_listeners[port]
+        self.control_writer.write(struct.pack('!BII', CMD_UNREGISTER_UDP_PORT, 4, port))
+        await self.control_writer.drain()
+        logger.info(f'UDP Port {port} unregistered')
+
+    async def _handle_udp_data(self, data: bytes):
+        """Receive UDP data from client and send to original UDP sender."""
+        # Frame: [Port:4][IPLen:1][IP:V][RemotePort:2][UDPData:N]
+        port = struct.unpack('!I', data[:4])[0]
+        ip_len = data[4]
+        ip = data[5:5+ip_len].decode()
+        remote_port = struct.unpack('!H', data[5+ip_len:7+ip_len])[0]
+        udp_content = data[7+ip_len:]
+        
+        if port in self.udp_listeners:
+            self.udp_listeners[port].send_to((ip, remote_port), udp_content)
+
     async def _cleanup(self):
         self._running = False
         for listener in list(self.port_listeners.values()):
             await listener.stop()
         self.port_listeners.clear()
+        
+        for listener in list(self.udp_listeners.values()):
+            listener.stop()
+        self.udp_listeners.clear()
         
         for channel in self.data_channels:
             channel.close()
@@ -345,6 +421,42 @@ class PortListener:
             logger.info(f'Port {self.port} listener stopped')
 
 
+class UDPListener(asyncio.DatagramProtocol):
+    """Listens for UDP packets and forwards them to client."""
+    
+    def __init__(self, port: int, protocol: FrpsMultiProtocol):
+        self.port = port
+        self.protocol = protocol
+        self.transport = None
+    
+    def connection_made(self, transport):
+        self.transport = transport
+        logger.info(f'UDP Listener on port {self.port} started')
+    
+    def datagram_received(self, data, addr):
+        """Receive UDP packet from local source, forward to client via TCP data channel."""
+        # logger.debug(f'UDP Packet from {addr} on port {self.port}')
+        
+        # Map source to a channel (round-robin)
+        channel = self.protocol.get_next_channel()
+        if not channel:
+            return
+            
+        # Frame: [Cmd:1][Length:4][Port:4][IPLen:1][IP:V][RemotePort:2][UDPData:N]
+        ip = addr[0].encode()
+        payload = struct.pack('!IB', self.port, len(ip)) + ip + struct.pack('!H', addr[1]) + data
+        
+        asyncio.create_task(channel.send_udp(payload))
+    
+    def send_to(self, addr, data):
+        if self.transport:
+            self.transport.sendto(data, addr)
+            
+    def stop(self):
+        if self.transport:
+            self.transport.close()
+
+
 class FrpsMultiServer:
     """Multi-connection FRP Server."""
     
@@ -384,13 +496,7 @@ class FrpsMultiServer:
             client_ip = addr[0]
             self.active_clients[client_ip] = protocol
             
-            # Handle control after data channels connect
-            await asyncio.sleep(2)  # Wait for data channels
-            
-            if len(protocol.data_channels) < self.num_data_channels:
-                logger.warning(f'Only {len(protocol.data_channels)}/{self.num_data_channels} data channels connected')
-            
-            logger.info(f'Client {client_ip} ready with {len(protocol.data_channels)} channels')
+            # Start control handling immediately
             try:
                 await protocol.handle_control()
             finally:

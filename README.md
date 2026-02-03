@@ -15,6 +15,7 @@ PFRP 是一个用 Python 编写的高性能 FRP (Fast Reverse Proxy) 客户端/�
 - 🎯 **跨平台支持** - 支持 Linux 和 Windows
 - 🔧 **服务管理** - Linux 下支持 systemd 服务注册
 - 📊 **性能监控** - 实时显示传输速率和性能指标
+- 🌍 **UDP 转发** - 支持 UDP 端口转发（实验性）
 
 ## 🚀 快速开始
 
@@ -57,14 +58,20 @@ pfrpc <server_host> <server_port> [options]
 **示例:**
 
 ```bash
-# 基本使用
+# 基本使用（TCP 端口自动扫描）
 pfrpc 192.168.1.100 7000
 
 # 自定义参数
 pfrpc example.com 7000 --channels 16 --target 127.0.0.1
 
-# 监控特定端口
+# 监控特定 TCP 端口
 pfrpc 192.168.1.100 7000 --ports 80,443,8080,3306
+
+# 转发 UDP 端口（实验性功能）
+pfrpc 192.168.1.100 7000 --udp-ports 53,1194
+
+# TCP + UDP 混合转发
+pfrpc 192.168.1.100 7000 --ports 80,443 --udp-ports 53
 
 # 调整扫描间隔
 pfrpc 192.168.1.100 7000 --interval 30
@@ -79,7 +86,8 @@ pfrpc 192.168.1.100 7000 --interval 30
 | `--channels` | 数据通道数量 | 16 |
 | `--target` | 目标主机 | 127.0.0.1 |
 | `--interval` | 端口扫描间隔(秒) | 20 |
-| `--ports` | 监控的端口列表(逗号分隔) | 自动扫描 |
+| `--ports` | 监控的 TCP 端口列表(逗号分隔) | 自动扫描 |
+| `--udp-ports` | 转发的 UDP 端口列表(逗号分隔) | 空 |
 
 ### 服务器 (pfrps)
 
