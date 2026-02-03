@@ -1,0 +1,16 @@
+FROM python:3.14-slim
+
+WORKDIR /build
+
+RUN apt-get update && \
+    apt-get install -y build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install pyinstaller
+
+COPY frp_python /build/frp_python
+
+RUN pyinstaller --onefile --name frpc_multi --distpath dist/linux frp_python/frpc_multi.py && \
+    pyinstaller --onefile --name frps_multi --distpath dist/linux frp_python/frps_multi.py
+
+CMD ["bash"]
