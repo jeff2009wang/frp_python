@@ -32,6 +32,7 @@ CMD_CONNECTION_ACK = 5
 CMD_REGISTER_UDP_PORT = 6
 CMD_UNREGISTER_UDP_PORT = 7
 CMD_UDP_DATA = 8
+CMD_CLOSE_STREAM = 9
 
 # Frame: [StreamID:4][Length:4][Data:N]
 FRAME_HEADER_SIZE = 8
@@ -79,7 +80,7 @@ class PerformanceStats:
             avg_send = (self.time_sending * 1000 / self.send_count) if self.send_count > 0 else 0
             
             stat_line = (f'[PERF] Recv: {recv_rate:6.2f} MB/s | Sent: {sent_rate:6.2f} MB/s | '
-                         f'RTT: {avg_read:5.2f}ms/{avg_send:5.2f}ms')
+                         f'Wait/Proc: {avg_read:7.2f}ms/{avg_send:5.2f}ms')
             sys.stdout.write(f"\r{time.strftime('%H:%M:%S')} {stat_line}")
             sys.stdout.flush()
             
@@ -267,6 +268,10 @@ class FrpcMultiProtocol:
                 elif cmd == CMD_CONNECTION:
                     stream_id, port, conn_id = struct.unpack('!III', data)
                     await self._handle_connection(stream_id, port, conn_id)
+                elif cmd == CMD_CLOSE_STREAM:
+                    stream_id = struct.unpack('!I', data)[0]
+                    if stream_id in self.active_streams:
+                        self.active_streams.pop(stream_id).close()
                 elif cmd == CMD_REGISTER_UDP_PORT:
                     port = struct.unpack('!I', data)[0]
                     if port > 0:
@@ -467,6 +472,16 @@ class FrpcMultiProtocol:
         finally:
             if stream_id in self.active_streams:
                 self.active_streams.pop(stream_id).close()
+            logger.info(f'Stream {stream_id} closed')
+            
+            # Notify server to close user connection
+            if self.control_writer and not self.control_writer.is_closing():
+                try:
+                    self.control_writer.write(struct.pack('!BII', CMD_CLOSE_STREAM, 4, stream_id))
+                    # Note: We don't await drain here to avoid blocking cleanup if control is congested
+                except:
+                    pass
+                
             if stream_id in self.stream_to_channel:
                 del self.stream_to_channel[stream_id]
 

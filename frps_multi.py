@@ -30,6 +30,7 @@ CMD_CONNECTION_ACK = 5
 CMD_REGISTER_UDP_PORT = 6
 CMD_UNREGISTER_UDP_PORT = 7
 CMD_UDP_DATA = 8
+CMD_CLOSE_STREAM = 9
 
 # Frame: [StreamID:4][Length:4][Data:N]
 FRAME_HEADER_SIZE = 8
@@ -77,7 +78,7 @@ class PerformanceStats:
             avg_send = (self.time_sending * 1000 / self.send_count) if self.send_count > 0 else 0
             
             stat_line = (f'[PERF] Recv: {recv_rate:6.2f} MB/s | Sent: {sent_rate:6.2f} MB/s | '
-                         f'RTT: {avg_read:5.2f}ms/{avg_send:5.2f}ms')
+                         f'Wait/Proc: {avg_read:7.2f}ms/{avg_send:5.2f}ms')
             sys.stdout.write(f"\r{time.strftime('%H:%M:%S')} {stat_line}")
             sys.stdout.flush()
             
@@ -182,6 +183,10 @@ class FrpsMultiProtocol:
                     await self._handle_unregister_udp_port(data)
                 elif cmd == CMD_UDP_DATA:
                     await self._handle_udp_data(data)
+                elif cmd == CMD_CLOSE_STREAM:
+                    stream_id = struct.unpack('!I', data)[0]
+                    if stream_id in self.stream_to_user:
+                        self.stream_to_user[stream_id].close()
                 elif cmd == CMD_CONNECTION_ACK:
                     stream_id = struct.unpack('!I', data)[0]
                     self.stream_ready.add(stream_id)
@@ -316,7 +321,7 @@ class FrpsMultiProtocol:
     async def _handle_unregister_port(self, data: bytes):
         port = struct.unpack('!I', data)[0]
         if port in self.port_listeners:
-            self.port_listeners[port].stop()
+            await self.port_listeners[port].stop()
             del self.port_listeners[port]
         self.control_writer.write(struct.pack('!BII', CMD_UNREGISTER_PORT, 4, port))
         await self.control_writer.drain()
@@ -405,6 +410,15 @@ class PortListener:
             logger.debug(f'User error: {e}')
         finally:
             writer.close()
+            logger.info(f'Stream {stream_id} closed')
+            # Notify client to close local connection
+            if self.protocol.control_writer and not self.protocol.control_writer.is_closing():
+                try:
+                    self.protocol.control_writer.write(struct.pack('!BII', CMD_CLOSE_STREAM, 4, stream_id))
+                    await self.protocol.control_writer.drain()
+                except:
+                    pass
+            
             if stream_id in self.protocol.stream_to_user:
                 del self.protocol.stream_to_user[stream_id]
             if stream_id in self.protocol.stream_to_channel:
