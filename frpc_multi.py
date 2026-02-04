@@ -72,16 +72,16 @@ class PerformanceStats:
     def maybe_report(self):
         now = time.time()
         if now - self.last_report_time >= self.report_interval:
-            elapsed = now - self.last_report_time
-            recv_rate = self.bytes_recv / elapsed / 1024 / 1024
-            sent_rate = self.bytes_sent / elapsed / 1024 / 1024
+            duration = now - self.last_report_time
+            recv_rate = self.bytes_recv / (1024 * 1024) / duration
+            sent_rate = self.bytes_sent / (1024 * 1024) / duration
+            avg_read = (self.time_reading * 1000 / self.read_count) if self.read_count > 0 else 0
+            avg_send = (self.time_sending * 1000 / self.send_count) if self.send_count > 0 else 0
             
-            avg_read = (self.time_reading / self.read_count * 1000) if self.read_count > 0 else 0
-            avg_send = (self.time_sending / self.send_count * 1000) if self.send_count > 0 else 0
-            
-            logger.info(f'[PERF] Recv: {recv_rate:.2f} MB/s ({self.packets_recv} pkts) | '
-                        f'Sent: {sent_rate:.2f} MB/s ({self.packets_sent} pkts) | '
-                        f'AvgRead: {avg_read:.2f}ms | AvgSend: {avg_send:.2f}ms')
+            stat_line = (f'[PERF] Recv: {recv_rate:6.2f} MB/s | Sent: {sent_rate:6.2f} MB/s | '
+                         f'RTT: {avg_read:5.2f}ms/{avg_send:5.2f}ms')
+            sys.stdout.write(f"\r{time.strftime('%H:%M:%S')} {stat_line}")
+            sys.stdout.flush()
             
             self.bytes_sent = 0
             self.bytes_recv = 0
@@ -344,12 +344,18 @@ class FrpcMultiProtocol:
                     lambda: UDPForwarder(port, ip, remote_port, self),
                     remote_addr=(self.target_host, port)
                 )
-                self.udp_clients[key] = transport
+                self.udp_clients[key] = {
+                    'transport': transport,
+                    'last_activity': time.time()
+                }
+                logger.info(f"Created new UDP session for {ip}:{remote_port} -> local:{port}")
             except Exception as e:
                 logger.error(f'Failed to create local UDP client: {e}')
                 return
         
-        self.udp_clients[key].sendto(udp_content)
+        entry = self.udp_clients[key]
+        entry['transport'].sendto(udp_content)
+        entry['last_activity'] = time.time()
     
     def adjust_network_mode(self, is_weak: bool):
         """Adjust buffer sizes based on network mode."""
@@ -379,13 +385,11 @@ class FrpcMultiProtocol:
         self.control_writer.write(struct.pack('!BII', CMD_REGISTER_PORT, 4, port))
         await self.control_writer.drain()
         self.registered_ports.add(port)
-        logger.info(f'Sent register TCP port {port}')
     
     async def register_udp_port(self, port: int):
         """Register a UDP port."""
         self.control_writer.write(struct.pack('!BII', CMD_REGISTER_UDP_PORT, 4, port))
         await self.control_writer.drain()
-        logger.info(f'Sent register UDP port {port}')
 
     async def unregister_port(self, port: int):
         """Unregister a TCP port."""
@@ -635,9 +639,11 @@ class FrpcMultiClient:
         asyncio.create_task(self._heartbeat_loop())
         asyncio.create_task(self._port_monitor_loop())
         asyncio.create_task(self._process_port_changes())
+        asyncio.create_task(self._udp_cleanup_loop())
         
         # Initial UDP registration
         if hasattr(self, 'udp_ports') and self.udp_ports:
+            logger.info(f'Registering UDP ports: {", ".join(map(str, self.udp_ports))}')
             for port in self.udp_ports:
                 await self.protocol.register_udp_port(port)
         
@@ -677,6 +683,14 @@ class FrpcMultiClient:
                     self.port_change_queue = self.port_change_queue[10:]
                     
                     tasks = []
+                    new_tcp = [port for ct, port in batch if ct == 'new']
+                    closed_tcp = [port for ct, port in batch if ct == 'closed']
+                    
+                    if new_tcp:
+                        logger.info(f'Adding TCP ports: {", ".join(map(str, new_tcp))}')
+                    if closed_tcp:
+                        logger.info(f'Closing TCP ports: {", ".join(map(str, closed_tcp))}')
+
                     for change_type, port in batch:
                         if change_type == 'new':
                             tasks.append(self.protocol.register_port(port))
@@ -688,6 +702,30 @@ class FrpcMultiClient:
                         await asyncio.gather(*tasks, return_exceptions=True)
             await asyncio.sleep(0.05)
     
+    async def _udp_cleanup_loop(self):
+        """Periodically clean up idle UDP sessions."""
+        while self.running and self.protocol:
+            try:
+                await asyncio.sleep(30)
+                if not hasattr(self.protocol, 'udp_clients'):
+                    continue
+                
+                now = time.time()
+                timeout = 60 # 60 seconds idle timeout
+                to_delete = []
+                
+                for key, entry in self.protocol.udp_clients.items():
+                    if now - entry['last_activity'] > timeout:
+                        entry['transport'].close()
+                        to_delete.append(key)
+                        logger.info(f"Cleaned up idle UDP session for {key[1]}:{key[2]}")
+                
+                for key in to_delete:
+                    del self.protocol.udp_clients[key]
+            except Exception as e:
+                logger.error(f"UDP cleanup error: {e}")
+                await asyncio.sleep(5)
+
     def on_port_change(self, change_type: str, port: int):
         with self.port_change_lock:
             self.port_change_queue.append((change_type, port))
@@ -704,8 +742,7 @@ def main():
         print('  --channels NUM    Data channels (default: 4)')
         print('  --target HOST     Target host (default: 127.0.0.1)')
         print('  --interval SECS   Scan interval (default: 20)')
-        print('  --ports PORTS     TCP ports to monitor (comma-separated)')
-        print('  --udp-ports PORTS UDP ports to forward (comma-separated)')
+        print('  --ports PORTS     Ports to monitor (comma-separated)')
         sys.exit(1)
     
     server_host = sys.argv[1]

@@ -70,16 +70,16 @@ class PerformanceStats:
     def maybe_report(self):
         now = time.time()
         if now - self.last_report_time >= self.report_interval:
-            elapsed = now - self.last_report_time
-            recv_rate = self.bytes_recv / elapsed / 1024 / 1024
-            sent_rate = self.bytes_sent / elapsed / 1024 / 1024
+            duration = now - self.last_report_time
+            recv_rate = self.bytes_recv / (1024 * 1024) / duration
+            sent_rate = self.bytes_sent / (1024 * 1024) / duration
+            avg_read = (self.time_reading * 1000 / self.read_count) if self.read_count > 0 else 0
+            avg_send = (self.time_sending * 1000 / self.send_count) if self.send_count > 0 else 0
             
-            avg_read = (self.time_reading / self.read_count * 1000) if self.read_count > 0 else 0
-            avg_send = (self.time_sending / self.send_count * 1000) if self.send_count > 0 else 0
-            
-            logger.info(f'[PERF] Recv: {recv_rate:.2f} MB/s ({self.packets_recv} pkts) | '
-                        f'Sent: {sent_rate:.2f} MB/s ({self.packets_sent} pkts) | '
-                        f'AvgRead: {avg_read:.2f}ms | AvgSend: {avg_send:.2f}ms')
+            stat_line = (f'[PERF] Recv: {recv_rate:6.2f} MB/s | Sent: {sent_rate:6.2f} MB/s | '
+                         f'RTT: {avg_read:5.2f}ms/{avg_send:5.2f}ms')
+            sys.stdout.write(f"\r{time.strftime('%H:%M:%S')} {stat_line}")
+            sys.stdout.flush()
             
             self.bytes_sent = 0
             self.bytes_recv = 0
@@ -247,7 +247,6 @@ class FrpsMultiProtocol:
             
             self.control_writer.write(struct.pack('!BII', CMD_REGISTER_UDP_PORT, 4, port))
             await self.control_writer.drain()
-            logger.info(f'UDP Port {port} registered')
         except Exception as e:
             logger.error(f'Failed to register UDP port {port}: {e}')
             self.control_writer.write(struct.pack('!BII', CMD_REGISTER_UDP_PORT, 4, 0))
@@ -260,7 +259,6 @@ class FrpsMultiProtocol:
             del self.udp_listeners[port]
         self.control_writer.write(struct.pack('!BII', CMD_UNREGISTER_UDP_PORT, 4, port))
         await self.control_writer.drain()
-        logger.info(f'UDP Port {port} unregistered')
 
     async def _handle_udp_data(self, data: bytes):
         """Receive UDP data from client and send to original UDP sender."""
@@ -310,7 +308,6 @@ class FrpsMultiProtocol:
             
             self.control_writer.write(struct.pack('!BII', CMD_REGISTER_PORT, 4, port))
             await self.control_writer.drain()
-            logger.info(f'Port {port} registered')
         except Exception as e:
             logger.error(f'Failed to register port {port}: {e}')
             self.control_writer.write(struct.pack('!BII', CMD_REGISTER_PORT, 4, 0))
@@ -323,7 +320,6 @@ class FrpsMultiProtocol:
             del self.port_listeners[port]
         self.control_writer.write(struct.pack('!BII', CMD_UNREGISTER_PORT, 4, port))
         await self.control_writer.drain()
-        logger.info(f'Port {port} unregistered')
 
 
 class PortListener:
