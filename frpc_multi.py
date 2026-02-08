@@ -270,8 +270,7 @@ class FrpcMultiProtocol:
                     await self._handle_connection(stream_id, port, conn_id)
                 elif cmd == CMD_CLOSE_STREAM:
                     stream_id = struct.unpack('!I', data)[0]
-                    if stream_id in self.active_streams:
-                        self.active_streams.pop(stream_id).close()
+                    self._cleanup_stream(stream_id)
                 elif cmd == CMD_REGISTER_UDP_PORT:
                     port = struct.unpack('!I', data)[0]
                     if port > 0:
@@ -378,12 +377,29 @@ class FrpcMultiProtocol:
             if not writer.is_closing():
                 writer.transport.set_write_buffer_limits(high=size * 1024 * 1024)
     
+    def _cleanup_stream(self, stream_id: int):
+        """Clean up all resources associated with a stream."""
+        if stream_id in self.active_streams:
+            try:
+                self.active_streams[stream_id].close()
+            except:
+                pass
+            del self.active_streams[stream_id]
+        if stream_id in self.stream_to_channel:
+            del self.stream_to_channel[stream_id]
+        logger.debug(f'Stream {stream_id} resources cleaned up')
+    
     def _cleanup(self):
         self._running = False
         for channel in self.data_channels:
             channel.close()
         for writer in self.active_streams.values():
-            writer.close()
+            try:
+                writer.close()
+            except:
+                pass
+        self.active_streams.clear()
+        self.stream_to_channel.clear()
     
     async def register_port(self, port: int):
         """Register a TCP port."""
@@ -470,8 +486,6 @@ class FrpcMultiProtocol:
         except Exception as e:
             logger.debug(f'Forward error: {e}')
         finally:
-            if stream_id in self.active_streams:
-                self.active_streams.pop(stream_id).close()
             logger.info(f'Stream {stream_id} closed')
             
             # Notify server to close user connection
@@ -481,9 +495,9 @@ class FrpcMultiProtocol:
                     # Note: We don't await drain here to avoid blocking cleanup if control is congested
                 except:
                     pass
-                
-            if stream_id in self.stream_to_channel:
-                del self.stream_to_channel[stream_id]
+            
+            # Clean up all stream resources
+            self._cleanup_stream(stream_id)
 
 
 class PortScanner:

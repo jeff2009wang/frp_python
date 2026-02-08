@@ -185,8 +185,7 @@ class FrpsMultiProtocol:
                     await self._handle_udp_data(data)
                 elif cmd == CMD_CLOSE_STREAM:
                     stream_id = struct.unpack('!I', data)[0]
-                    if stream_id in self.stream_to_user:
-                        self.stream_to_user[stream_id].close()
+                    self._cleanup_stream(stream_id)
                 elif cmd == CMD_CONNECTION_ACK:
                     stream_id = struct.unpack('!I', data)[0]
                     self.stream_ready.add(stream_id)
@@ -277,6 +276,20 @@ class FrpsMultiProtocol:
         if port in self.udp_listeners:
             self.udp_listeners[port].send_to((ip, remote_port), udp_content)
 
+    def _cleanup_stream(self, stream_id: int):
+        """Clean up all resources associated with a stream."""
+        if stream_id in self.stream_to_user:
+            try:
+                self.stream_to_user[stream_id].close()
+            except:
+                pass
+            del self.stream_to_user[stream_id]
+        if stream_id in self.stream_to_channel:
+            del self.stream_to_channel[stream_id]
+        if stream_id in self.stream_ready:
+            self.stream_ready.discard(stream_id)
+        logger.debug(f'Stream {stream_id} resources cleaned up')
+    
     async def _cleanup(self):
         self._running = False
         for listener in list(self.port_listeners.values()):
@@ -290,7 +303,13 @@ class FrpsMultiProtocol:
         for channel in self.data_channels:
             channel.close()
         for writer in self.stream_to_user.values():
-            writer.close()
+            try:
+                writer.close()
+            except:
+                pass
+        self.stream_to_user.clear()
+        self.stream_to_channel.clear()
+        self.stream_ready.clear()
     
     async def _handle_register_port(self, data: bytes):
         port = struct.unpack('!I', data)[0]
@@ -419,10 +438,8 @@ class PortListener:
                 except:
                     pass
             
-            if stream_id in self.protocol.stream_to_user:
-                del self.protocol.stream_to_user[stream_id]
-            if stream_id in self.protocol.stream_to_channel:
-                del self.protocol.stream_to_channel[stream_id]
+            # Clean up all stream resources
+            self.protocol._cleanup_stream(stream_id)
     
     async def stop(self):
         if self.server:
