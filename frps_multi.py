@@ -245,14 +245,21 @@ class FrpsMultiProtocol:
                             self.reassemblers[stream_id] = SequenceReassembler()
 
                         reasm = self.reassemblers[stream_id]
+
+                        # Backpressure: if reassembler is near full, pause to let
+                        # the writer drain before accepting more data.
+                        while reasm.is_near_full():
+                            await asyncio.sleep(0.005)
+
                         chunks = await reasm.receive(seq, data)
-                        for _, chunk in chunks:
+                        if chunks:
                             t2 = time.time()
-                            writer.write(chunk)
+                            for _, chunk in chunks:
+                                writer.write(chunk)
                             await writer.drain()
                             t3 = time.time()
                             perf_stats.add_send_time(t3 - t2)
-                            perf_stats.add_sent(len(chunk))
+                            perf_stats.add_sent(sum(len(c) for _, c in chunks))
 
                     perf_stats.maybe_report()
 

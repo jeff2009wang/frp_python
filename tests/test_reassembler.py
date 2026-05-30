@@ -154,3 +154,22 @@ class TestSequenceReassembler:
         assert result[0] == (1, b'start')
         assert result[1] == (2, b'x' * 1000)
         assert result[-1] == (101, b'x' * 1000)
+
+    async def test_is_near_full(self):
+        """Backpressure: is_near_full reflects buffered size threshold."""
+        reassembler = SequenceReassembler()
+        assert not reassembler.is_near_full()
+
+        # Buffer one out-of-order chunk at 50% of threshold
+        threshold = int(REASSEMBLER_MAX_BUFFER * 0.80)
+        half = threshold // 2
+        await reassembler.receive(2, b'x' * half)
+        assert not reassembler.is_near_full()
+
+        # Buffer another chunk to push past 80%
+        await reassembler.receive(3, b'y' * (threshold - half + 1))
+        assert reassembler.is_near_full()
+
+        # Draining the buffer (simulated) should clear the flag
+        reassembler.reset()
+        assert not reassembler.is_near_full()

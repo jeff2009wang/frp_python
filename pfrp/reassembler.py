@@ -5,7 +5,11 @@ import logging
 import time
 from typing import Dict, List, Tuple
 
-from pfrp.constants import REASSEMBLER_MAX_BUFFER, REASSEMBLER_TIMEOUT_MS
+from pfrp.constants import (
+    REASSEMBLER_BACKPRESSURE_THRESHOLD,
+    REASSEMBLER_MAX_BUFFER,
+    REASSEMBLER_TIMEOUT_MS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +95,10 @@ class SequenceReassembler:
             return False
         elapsed_ms = (time.monotonic() - self._last_receive_time) * 1000.0
         return elapsed_ms > timeout_ms
+
+    def is_near_full(self) -> bool:
+        """Return True if buffered data exceeds the backpressure threshold."""
+        return self._buffered_size >= int(REASSEMBLER_MAX_BUFFER * REASSEMBLER_BACKPRESSURE_THRESHOLD)
 
     def reset(self) -> None:
         """Clear all state."""

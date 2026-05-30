@@ -49,7 +49,8 @@ CHUNK_SIZE_DIVISOR = 4                        # BDP / channels / divisor
 
 # Reassembler
 REASSEMBLER_TIMEOUT_MS = 500                  # 500ms
-REASSEMBLER_MAX_BUFFER = 16 * 1024 * 1024     # 16MB
+REASSEMBLER_MAX_BUFFER = 64 * 1024 * 1024     # 64MB
+REASSEMBLER_BACKPRESSURE_THRESHOLD = 0.80     # pause reads at 80% capacity
 
 # Channel monitor
 MONITOR_WINDOW_SIZE = 50                      # samples
