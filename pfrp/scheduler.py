@@ -17,6 +17,8 @@ class MultiChannelScheduler:
         self._monitor = monitor
         # stream_id -> next sequence number
         self._seq_counters: Dict[str, int] = {}
+        # round-robin index for fair channel selection
+        self._rr_index: int = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -40,8 +42,17 @@ class MultiChannelScheduler:
         return max(CHUNK_SIZE_MIN, min(CHUNK_SIZE_MAX, chunk_size))
 
     def _select_channel(self) -> str:
-        """Select a channel using weighted selection from the monitor."""
-        return self._monitor.get_weighted_channel()
+        """Select a channel using round-robin for bounded out-of-order.
+
+        Round-robin ensures each channel gets exactly 1/N of the traffic,
+        keeping the reassembler buffer bounded to num_channels * chunk_size.
+        """
+        channels = self._monitor._channels
+        if not channels:
+            return None
+        ch = channels[self._rr_index % len(channels)]
+        self._rr_index += 1
+        return ch
 
     def _get_next_seq(self, stream_id: str) -> int:
         """Return the next sequence number for a stream and increment."""
