@@ -28,6 +28,11 @@ from pfrp.constants import (
     CMD_ENABLE_MULTI_CHANNEL, CMD_MULTI_CHANNEL_ACK, CMD_MULTI_CHANNEL_NACK,
     FRAME_HEADER_SIZE,
 )
+from pfrp.batch_sender import BatchSender
+from pfrp.channel_monitor import ChannelQualityMonitor
+from pfrp.flow_classifier import FlowClassifier
+from pfrp.scheduler import MultiChannelScheduler
+from pfrp.reassembler import SequenceReassembler
 
 
 class PerformanceStats:
@@ -151,36 +156,44 @@ net_monitor = NetworkMonitor()
 
 class DataChannel:
     """A single data channel connection with optimized throughput."""
-    
+
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, channel_id: int):
         self.reader = reader
         self.writer = writer
         self.channel_id = channel_id
         self.active = True
-    
-    async def send(self, stream_id: int, data: bytes):
-        """Send TCP data."""
-        header = struct.pack('!II', stream_id, len(data))
-        self.writer.write(header + data)
-        await self.writer.drain()
+        self.batch_sender = BatchSender(writer)
+        self.batch_sender.start()
+
+    async def send(self, stream_id: int, seq: int, data: bytes):
+        """Send TCP data with sequence number (multi-channel mode)."""
+        header = struct.pack('!IIQ', stream_id, len(data), seq)
+        self.batch_sender.write(header + data)
+        await self.batch_sender.maybe_flush()
+
+    async def send_single(self, stream_id: int, data: bytes):
+        """Send TCP data in single-channel mode (seq=0)."""
+        header = struct.pack('!IIQ', stream_id, len(data), 0)
+        self.batch_sender.write(header + data)
+        await self.batch_sender.maybe_flush()
 
     async def send_udp(self, payload: bytes):
         """Send UDP data encapsulated in CMD_UDP_DATA."""
-        header = struct.pack('!II', 0, len(payload) + 1)
-        self.writer.write(header + struct.pack('!B', CMD_UDP_DATA) + payload)
-        await self.writer.drain()
-    
+        header = struct.pack('!IIQ', 0, len(payload) + 1, 0)
+        self.batch_sender.write(header + struct.pack('!B', CMD_UDP_DATA) + payload)
+        await self.batch_sender.flush()
+
     async def flush(self):
-        await self.writer.drain()
-        
+        await self.batch_sender.flush()
+
     def set_buffer_size(self, size_mb: int):
         """Dynamically adjust write buffer limits."""
         limit = size_mb * 1024 * 1024
         self.writer.transport.set_write_buffer_limits(high=limit)
-    
+
     def close(self):
         self.active = False
-        self.writer.close()
+        asyncio.create_task(self.batch_sender.close())
 
 
 class UDPForwarder(asyncio.DatagramProtocol):
@@ -209,8 +222,9 @@ class UDPForwarder(asyncio.DatagramProtocol):
 class FrpcMultiProtocol:
     """Multi-connection FRP Client Protocol."""
     
-    def __init__(self, target_host: str = '127.0.0.1'):
+    def __init__(self, target_host: str = '127.0.0.1', num_channels: int = 16):
         self.target_host = target_host
+        self.num_channels = num_channels
         self.control_reader: Optional[asyncio.StreamReader] = None
         self.control_writer: Optional[asyncio.StreamWriter] = None
         self.data_channels: List[DataChannel] = []
@@ -221,6 +235,12 @@ class FrpcMultiProtocol:
         self._running = True
         self._channel_index = 0
         self._tasks: Set[asyncio.Task] = set()
+
+        # New components for multi-channel optimization
+        self.channel_monitor = ChannelQualityMonitor()
+        self.flow_classifier = FlowClassifier(self.channel_monitor)
+        self.scheduler = MultiChannelScheduler(self.channel_monitor)
+        self.reassemblers: Dict[int, SequenceReassembler] = {}  # stream_id -> SequenceReassembler
     
     def get_next_channel(self) -> DataChannel:
         """Round-robin channel selection."""
@@ -265,6 +285,14 @@ class FrpcMultiProtocol:
                 elif cmd == CMD_CLOSE_STREAM:
                     stream_id = struct.unpack('!I', data)[0]
                     self._cleanup_stream(stream_id)
+                elif cmd == CMD_ENABLE_MULTI_CHANNEL:
+                    stream_id = struct.unpack('!I', data)[0]
+                    self.flow_classifier.stream_mode[stream_id] = FlowClassifier.MODE_MULTI
+                    self.control_writer.write(
+                        struct.pack('!BII', CMD_MULTI_CHANNEL_ACK, 4, stream_id)
+                    )
+                    await self.control_writer.drain()
+                    logger.info(f'Stream {stream_id} multi-channel enabled')
                 elif cmd == CMD_REGISTER_UDP_PORT:
                     port = struct.unpack('!I', data)[0]
                     if port > 0:
@@ -283,33 +311,50 @@ class FrpcMultiProtocol:
             self._cleanup()
     
     async def handle_data_channel(self, channel: DataChannel):
-        """Handle incoming data on a channel (download: server → client → local)."""
+        """Handle incoming data on a channel (download direction)."""
         try:
             while channel.active and self._running:
                 t0 = time.time()
                 header = await channel.reader.readexactly(FRAME_HEADER_SIZE)
-                stream_id, length = struct.unpack('!II', header)
+                stream_id, length, seq = struct.unpack('!IIQ', header)
                 data = await channel.reader.readexactly(length) if length > 0 else b''
                 t1 = time.time()
-                
+
                 perf_stats.add_read_time(t1 - t0)
                 perf_stats.add_recv(len(data))
-                
+
                 if stream_id == 0:
-                    # Special data (UDP or Control)
+                    # UDP or control data
                     if data.startswith(struct.pack('!B', CMD_UDP_DATA)):
                         await self._handle_udp_data(data[1:])
                 elif stream_id in self.active_streams:
                     writer = self.active_streams[stream_id]
-                    t2 = time.time()
-                    writer.write(data)
-                    await writer.drain()
-                    t3 = time.time()
-                    
-                    perf_stats.add_send_time(t3 - t2)
-                    perf_stats.add_sent(len(data))
+
+                    if seq == 0:
+                        # Single-channel mode: direct write
+                        t2 = time.time()
+                        writer.write(data)
+                        await writer.drain()
+                        t3 = time.time()
+                        perf_stats.add_send_time(t3 - t2)
+                        perf_stats.add_sent(len(data))
+                    else:
+                        # Multi-channel mode: reassemble
+                        if stream_id not in self.reassemblers:
+                            self.reassemblers[stream_id] = SequenceReassembler()
+
+                        reasm = self.reassemblers[stream_id]
+                        chunks = reasm.receive(seq, data)
+                        for _, chunk in chunks:
+                            t2 = time.time()
+                            writer.write(chunk)
+                            await writer.drain()
+                            t3 = time.time()
+                            perf_stats.add_send_time(t3 - t2)
+                            perf_stats.add_sent(len(chunk))
+
                     perf_stats.maybe_report()
-                    
+
         except asyncio.IncompleteReadError:
             logger.info(f'Data channel {channel.channel_id} closed')
         except Exception as e:
@@ -388,6 +433,10 @@ class FrpcMultiProtocol:
             del self.active_streams[stream_id]
         if stream_id in self.stream_to_channel:
             del self.stream_to_channel[stream_id]
+        if stream_id in self.reassemblers:
+            del self.reassemblers[stream_id]
+        self.flow_classifier.remove_stream(str(stream_id))
+        self.scheduler.remove_stream(str(stream_id))
         logger.debug(f'Stream {stream_id} resources cleaned up')
     
     def _cleanup(self):
@@ -475,26 +524,48 @@ class FrpcMultiProtocol:
                 t0 = time.time()
                 data = await reader.read(buffer_size)
                 t1 = time.time()
-                
+
                 if not data:
                     break
-                
+
                 perf_stats.add_read_time(t1 - t0)
                 perf_stats.add_recv(len(data))
-                
+
+                # Classify and route
+                self.flow_classifier.record_bytes(
+                    str(stream_id), len(data), time.time()
+                )
+
                 t2 = time.time()
-                await channel.send(stream_id, data)
+                if self.flow_classifier.get_mode(str(stream_id)) == FlowClassifier.MODE_MULTI:
+                    # Multi-channel: split into chunks
+                    chunks = self.scheduler.get_chunks(str(stream_id), data)
+                    for channel_id, seq, chunk in chunks:
+                        # Convert channel_id (str) to index
+                        ch_idx = int(channel_id) % len(self.data_channels)
+                        ch = self.data_channels[ch_idx]
+                        if ch.active:
+                            self.channel_monitor.record_sent(
+                                channel_id, len(chunk), time.time()
+                            )
+                            await ch.send(stream_id, seq, chunk)
+                else:
+                    # Single-channel: use assigned channel
+                    await channel.send_single(stream_id, data)
+                    self.channel_monitor.record_sent(
+                        str(channel.channel_id), len(data), time.time()
+                    )
+
                 t3 = time.time()
-                
                 perf_stats.add_send_time(t3 - t2)
                 perf_stats.add_sent(len(data))
                 perf_stats.maybe_report()
-                
+
         except Exception as e:
             logger.debug(f'Forward error: {e}')
         finally:
             logger.info(f'Stream {stream_id} closed')
-            
+
             # Notify server to close user connection
             if self.control_writer and not self.control_writer.is_closing():
                 try:
