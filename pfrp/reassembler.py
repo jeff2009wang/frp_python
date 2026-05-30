@@ -20,7 +20,7 @@ class SequenceReassembler:
     """
 
     def __init__(self):
-        self._next_seq: int = 0
+        self._next_seq: int = 1
         self._buffer: Dict[int, bytes] = {}
         self._buffered_size: int = 0
         self._last_receive_time: float = 0.0
@@ -87,7 +87,7 @@ class SequenceReassembler:
 
     def reset(self) -> None:
         """Clear all state."""
-        self._next_seq = 0
+        self._next_seq = 1
         self._buffer.clear()
         self._buffered_size = 0
         self._last_receive_time = 0.0
