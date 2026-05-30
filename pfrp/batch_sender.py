@@ -57,8 +57,9 @@ class BatchSender:
         """Flush all buffered data to the writer and await drain()."""
         async with self._lock:
             if self._buffer:
-                self._writer.write(self._buffer)
-                self._buffer.clear()
+                data = self._buffer
+                self._buffer = bytearray()
+                self._writer.write(data)
                 await self._writer.drain()
 
     async def maybe_flush(self) -> None:
@@ -115,8 +116,9 @@ class BatchSender:
         # Final flush under lock
         async with self._lock:
             if self._buffer:
-                self._writer.write(self._buffer)
-                self._buffer.clear()
+                data = self._buffer
+                self._buffer = bytearray()
+                self._writer.write(data)
                 await self._writer.drain()
 
     async def __aenter__(self):
