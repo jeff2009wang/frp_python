@@ -606,6 +606,8 @@ class FrpsMultiServer:
                 protocol = self.active_clients[client_id]
                 channel = DataChannel(reader, writer, channel_id)
                 protocol.data_channels.append(channel)
+                # Register channel for quality monitoring
+                protocol.channel_monitor.register_channels([str(channel_id)])
                 logger.info(f'Data channel {channel_id} connected from {addr}')
 
                 # Start handling this channel

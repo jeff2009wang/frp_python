@@ -751,6 +751,10 @@ class FrpcMultiClient:
 
         logger.info(f'All {self.num_channels} data channels ready')
 
+        # Register channels for quality monitoring
+        channel_ids = [str(i) for i in range(self.num_channels)]
+        self.protocol.channel_monitor.register_channels(channel_ids)
+
         # Start tasks
         self._create_task(self._heartbeat_loop(), name='heartbeat')
         self._create_task(self._port_monitor_loop(), name='port_monitor')
