@@ -241,7 +241,14 @@ class FrpcMultiProtocol:
         self.flow_classifier = FlowClassifier(self.channel_monitor)
         self.scheduler = MultiChannelScheduler(self.channel_monitor)
         self.reassemblers: Dict[int, SequenceReassembler] = {}  # stream_id -> SequenceReassembler
-    
+
+    def _create_task(self, coro, name: str = None) -> asyncio.Task:
+        """Create a tracked asyncio task."""
+        task = asyncio.create_task(coro, name=name)
+        self._tasks.add(task)
+        task.add_done_callback(lambda t: self._tasks.discard(t))
+        return task
+
     def get_next_channel(self) -> DataChannel:
         """Round-robin channel selection."""
         if not self.data_channels:
