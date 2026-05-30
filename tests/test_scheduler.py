@@ -1,5 +1,7 @@
 """Unit tests for MultiChannelScheduler."""
 
+import time
+
 import pytest
 
 from pfrp.scheduler import MultiChannelScheduler
@@ -94,3 +96,74 @@ class TestMultiChannelScheduler:
         chunks_b2 = scheduler.get_chunks(stream_b, data)
         seqs_b2 = [seq for _, seq, _ in chunks_b2]
         assert seqs_b2[0] == seqs_b1[-1] + 1
+
+    def test_can_send_respects_in_flight_limit(self, scheduler):
+        """Test that can_send returns False when channel exceeds BDP."""
+        monitor = scheduler._monitor
+        # Set low throughput so BDP is small and easy to exceed
+        monitor._total_throughput_mbps = 1.0  # 1 Mbps
+        monitor.record_rtt("ch1", 100.0)
+
+        # BDP = 1 Mbps * 0.1s / 8 = 12.5 KB; limit = 25 KB
+        # After recording 1 MB in flight, can_send should be False
+        scheduler.record_sent("ch1", 1_000_000)
+        assert not scheduler.can_send("ch1", 100)
+
+    def test_get_chunks_buffers_data_when_channels_full(self, scheduler):
+        """Test that get_chunks buffers unsent data when all channels are at capacity."""
+        monitor = scheduler._monitor
+        # Set low throughput so BDP is tiny
+        monitor._total_throughput_mbps = 0.001  # 1 Kbps
+        monitor.record_rtt("ch1", 1.0)  # Very low RTT -> tiny BDP
+
+        # Fill the channel
+        scheduler.record_sent("ch1", 100_000_000)
+
+        # Now try to get chunks - should buffer all data
+        data = b"x" * CHUNK_SIZE_MIN
+        chunks = scheduler.get_chunks("stream1", data)
+        assert len(chunks) == 0
+        # Data should be buffered for next call
+        assert scheduler._pending_data.get("stream1") == data
+
+    def test_in_flight_expires_after_rtt_timeout(self, scheduler):
+        """Test that in-flight entries expire after RTT * 2."""
+        monitor = scheduler._monitor
+        monitor._total_throughput_mbps = 1.0  # 1 Mbps
+        monitor.record_rtt("ch1", 50.0)
+
+        # BDP = 1 Mbps * 0.05s / 8 = 6.25 KB; limit = 12.5 KB
+        scheduler.record_sent("ch1", 1_000_000)
+        assert not scheduler.can_send("ch1", 100)
+
+        # Simulate time passing beyond RTT * 2 (100 ms)
+        entries = scheduler._in_flight.get("ch1", [])
+        if entries:
+            # Manually age the entries by 10 seconds
+            aged = [(t - 10.0, b) for t, b in entries]
+            scheduler._in_flight["ch1"] = aged
+
+        assert scheduler.can_send("ch1", 100)
+
+    def test_get_chunks_returns_partial_when_some_channels_full(self, scheduler):
+        """Test that get_chunks uses channels with capacity and buffers rest."""
+        monitor = scheduler._monitor
+        # Need enough throughput so empty channels can fit a chunk
+        # BDP per channel = (10/3 Mbps) * 0.1s / 8 ≈ 41.7 KB; limit ≈ 83 KB > 16 KB chunk
+        monitor._total_throughput_mbps = 10.0  # 10 Mbps
+        monitor.record_rtt("ch1", 1.0)   # Tiny BDP -> full
+        monitor.record_rtt("ch2", 100.0) # Normal BDP -> available
+
+        # Fill ch1
+        scheduler.record_sent("ch1", 1_000_000)
+
+        # Reset round-robin so we start with ch1
+        scheduler._rr_index = 0
+
+        data = b"x" * (CHUNK_SIZE_MIN * 3)
+        chunks = scheduler.get_chunks("stream1", data)
+
+        # ch1 is full, so get_chunks should skip it and use ch2 or ch3
+        assert len(chunks) > 0
+        for ch_id, _, _ in chunks:
+            assert ch_id != "ch1"

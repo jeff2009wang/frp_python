@@ -460,16 +460,23 @@ class PortListener:
 
                 t2 = time.time()
                 if self.protocol.flow_classifier.get_mode(str(stream_id)) == FlowClassifier.MODE_MULTI:
-                    # Multi-channel: split into chunks
+                    # Multi-channel: split into chunks with backpressure
                     chunks = self.protocol.scheduler.get_chunks(str(stream_id), data)
-                    for channel_id, seq, chunk in chunks:
-                        ch_idx = int(channel_id) % len(self.protocol.data_channels)
-                        ch = self.protocol.data_channels[ch_idx]
-                        if ch.active:
-                            self.protocol.channel_monitor.record_sent(
-                                channel_id, len(chunk), now
-                            )
-                            await ch.send(stream_id, seq, chunk)
+                    while chunks or self.protocol.scheduler.has_pending_data(str(stream_id)):
+                        for channel_id, seq, chunk in chunks:
+                            ch_idx = int(channel_id) % len(self.protocol.data_channels)
+                            ch = self.protocol.data_channels[ch_idx]
+                            if ch.active:
+                                self.protocol.channel_monitor.record_sent(
+                                    channel_id, len(chunk), now
+                                )
+                                await ch.send(stream_id, seq, chunk)
+                        if self.protocol.scheduler.has_pending_data(str(stream_id)):
+                            # Channels at capacity; yield to let in-flight data drain
+                            await asyncio.sleep(0.005)
+                            chunks = self.protocol.scheduler.get_chunks(str(stream_id), b"")
+                        else:
+                            break
                 else:
                     # Single-channel: use assigned channel
                     await channel.send_single(stream_id, data)
