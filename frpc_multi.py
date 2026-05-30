@@ -351,7 +351,7 @@ class FrpcMultiProtocol:
                             self.reassemblers[stream_id] = SequenceReassembler()
 
                         reasm = self.reassemblers[stream_id]
-                        chunks = reasm.receive(seq, data)
+                        chunks = await reasm.receive(seq, data)
                         for _, chunk in chunks:
                             t2 = time.time()
                             writer.write(chunk)

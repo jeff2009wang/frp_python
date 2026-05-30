@@ -1,5 +1,6 @@
 """SequenceReassembler: reassemble out-of-order chunks from multiple channels."""
 
+import asyncio
 import logging
 import time
 from typing import Dict, List, Tuple
@@ -12,11 +13,15 @@ logger = logging.getLogger(__name__)
 class SequenceReassembler:
     """Receives chunks arriving out of order and reassembles them in sequence order.
 
+    This class is asyncio-safe: multiple tasks may call receive() concurrently
+    on the same instance without corrupting internal state.
+
     Attributes:
         _next_seq: The next expected sequence number.
         _buffer: Dict mapping sequence number -> bytes for out-of-order chunks.
         _buffered_size: Total byte size of buffered chunks.
         _last_receive_time: Timestamp (monotonic) of the last receive() call.
+        _lock: asyncio.Lock protecting all mutable state.
     """
 
     def __init__(self):
@@ -24,8 +29,9 @@ class SequenceReassembler:
         self._buffer: Dict[int, bytes] = {}
         self._buffered_size: int = 0
         self._last_receive_time: float = 0.0
+        self._lock = asyncio.Lock()
 
-    def receive(self, seq: int, data: bytes) -> List[Tuple[int, bytes]]:
+    async def receive(self, seq: int, data: bytes) -> List[Tuple[int, bytes]]:
         """Receive a chunk and return any consecutive chunks starting from next_seq.
 
         Args:
@@ -35,41 +41,42 @@ class SequenceReassembler:
         Returns:
             List of (seq, data) tuples that are now consecutive from next_seq.
         """
-        self._last_receive_time = time.monotonic()
+        async with self._lock:
+            self._last_receive_time = time.monotonic()
 
-        # Ignore already delivered chunks
-        if seq < self._next_seq:
-            return []
+            # Ignore already delivered chunks
+            if seq < self._next_seq:
+                return []
 
-        # If this chunk is the next expected, return it and any buffered consecutive chunks
-        if seq == self._next_seq:
-            self._next_seq += 1
-            result: List[Tuple[int, bytes]] = [(seq, data)]
-            while self._next_seq in self._buffer:
-                buffered_data = self._buffer.pop(self._next_seq)
-                self._buffered_size -= len(buffered_data)
-                result.append((self._next_seq, buffered_data))
+            # If this chunk is the next expected, return it and any buffered consecutive chunks
+            if seq == self._next_seq:
                 self._next_seq += 1
-            return result
+                result: List[Tuple[int, bytes]] = [(seq, data)]
+                while self._next_seq in self._buffer:
+                    buffered_data = self._buffer.pop(self._next_seq)
+                    self._buffered_size -= len(buffered_data)
+                    result.append((self._next_seq, buffered_data))
+                    self._next_seq += 1
+                return result
 
-        # Out-of-order chunk: buffer it
-        if seq in self._buffer:
-            # Duplicate in buffer, ignore
+            # Out-of-order chunk: buffer it
+            if seq in self._buffer:
+                # Duplicate in buffer, ignore
+                return []
+
+            # Enforce memory limit
+            if self._buffered_size + len(data) > REASSEMBLER_MAX_BUFFER:
+                logger.warning(
+                    "Reassembler buffer limit exceeded (%d > %d), dropping seq=%d",
+                    self._buffered_size + len(data),
+                    REASSEMBLER_MAX_BUFFER,
+                    seq,
+                )
+                return []
+
+            self._buffer[seq] = data
+            self._buffered_size += len(data)
             return []
-
-        # Enforce memory limit
-        if self._buffered_size + len(data) > REASSEMBLER_MAX_BUFFER:
-            logger.warning(
-                "Reassembler buffer limit exceeded (%d > %d), dropping seq=%d",
-                self._buffered_size + len(data),
-                REASSEMBLER_MAX_BUFFER,
-                seq,
-            )
-            return []
-
-        self._buffer[seq] = data
-        self._buffered_size += len(data)
-        return []
 
     def is_stalled(self, timeout_ms: int = REASSEMBLER_TIMEOUT_MS) -> bool:
         """Check if waiting too long for a missing sequence number.
