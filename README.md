@@ -24,18 +24,22 @@ PFRP 是一个用 Python 编写的高性能 FRP (Fast Reverse Proxy) 客户端/�
 #### 一键安装客户端
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jeff2009wang/frp_python/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/jeff2009wang/frp_python/main/install.sh -o install.sh
+chmod +x install.sh
+sudo ./install.sh
 ```
 
 #### 一键安装服务器
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jeff2009wang/frp_python/main/install.sh | sudo bash -s -- --server
+curl -fsSL https://raw.githubusercontent.com/jeff2009wang/frp_python/main/install.sh -o install.sh
+chmod +x install.sh
+sudo ./install.sh --server
 ```
 
 #### 下载预编译版本
 
-从 [GitHub Releases](https://github.com/jeff2009wang/frp_python/tree/main/dist/linux) 下载二进制文件：
+从 [GitHub Releases](https://github.com/jeff2009wang/frp_python/releases) 下载二进制文件：
 
 ```bash
 wget https://github.com/jeff2009wang/frp_python/raw/main/dist/linux/frpc_multi -O pfrpc
@@ -185,7 +189,8 @@ chmod +x build_linux.sh
 ```bash
 cd frp_python
 docker build -f Dockerfile.linux -t pfrp-linux .
-docker cp pfrp-linux:/build/dist/linux ./dist/
+mkdir -p dist
+docker run --rm -v $(pwd)/dist:/output pfrp-linux cp -r /build/dist/linux /output/
 ```
 
 ## 🎯 工作原理

@@ -82,6 +82,19 @@ get_download_url() {
     fi
 }
 
+download_file() {
+    local url=$1
+    local output=$2
+    if command -v wget &> /dev/null; then
+        wget -q --show-progress "$url" -O "$output"
+    elif command -v curl &> /dev/null; then
+        curl -fsSL --progress-bar "$url" -o "$output"
+    else
+        print_error "Neither wget nor curl is installed. Please install one of them."
+        exit 1
+    fi
+}
+
 install_client() {
     print_info "Installing PFRP Client..."
     
@@ -98,13 +111,13 @@ install_client() {
         print_info "Downloading frpc_multi from GitHub..."
     fi
     
-    wget -q --show-progress "${download_url}" -O frpc_multi || {
+    download_file "${download_url}" frpc_multi || {
         print_error "Failed to download frpc_multi"
         if [ "$USE_MIRROR" != "true" ]; then
             print_warning "Retrying with mirror..."
             USE_MIRROR="true"
             download_url=$(get_download_url "frpc_multi")
-            wget -q --show-progress "${download_url}" -O frpc_multi || {
+            download_file "${download_url}" frpc_multi || {
                 print_error "Failed to download from mirror as well"
                 exit 1
             }
@@ -139,13 +152,13 @@ install_server() {
         print_info "Downloading frps_multi from GitHub..."
     fi
     
-    wget -q --show-progress "${download_url}" -O frps_multi || {
+    download_file "${download_url}" frps_multi || {
         print_error "Failed to download frps_multi"
         if [ "$USE_MIRROR" != "true" ]; then
             print_warning "Retrying with mirror..."
             USE_MIRROR="true"
             download_url=$(get_download_url "frps_multi")
-            wget -q --show-progress "${download_url}" -O frps_multi || {
+            download_file "${download_url}" frps_multi || {
                 print_error "Failed to download from mirror as well"
                 exit 1
             }

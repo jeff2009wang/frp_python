@@ -1,4 +1,4 @@
 # FRP Python Multi-Connection Client/Server
 # No external dependencies - uses only Python standard library
 # PyInstaller is needed for building executables only
-pyinstaller>=6.0.0
+pyinstaller>=6.0.0,<7.0.0

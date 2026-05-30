@@ -8,7 +8,6 @@ import struct
 import logging
 import asyncio
 import time
-import heapq
 from typing import Dict, Optional, Set, List
 
 logging.basicConfig(
@@ -196,6 +195,7 @@ class FrpsMultiProtocol:
         except Exception as e:
             logger.error(f'Control error: {e}')
         finally:
+            self._running = False
             await self._cleanup()
     
     async def handle_data_channel(self, channel: DataChannel):
@@ -220,8 +220,9 @@ class FrpsMultiProtocol:
                     writer = self.stream_to_user[stream_id]
                     t2 = time.time()
                     writer.write(data)
+                    await writer.drain()
                     t3 = time.time()
-                    
+
                     perf_stats.add_send_time(t3 - t2)
                     perf_stats.add_sent(len(data))
                     perf_stats.maybe_report()
@@ -229,7 +230,7 @@ class FrpsMultiProtocol:
         except asyncio.IncompleteReadError:
             logger.info(f'Data channel {channel.channel_id} closed')
         except Exception as e:
-            logger.debug(f'Data channel error: {e}')
+            logger.error(f'Data channel error: {e}')
         finally:
             channel.close()
     
@@ -281,7 +282,7 @@ class FrpsMultiProtocol:
         if stream_id in self.stream_to_user:
             try:
                 self.stream_to_user[stream_id].close()
-            except:
+            except Exception:
                 pass
             del self.stream_to_user[stream_id]
         if stream_id in self.stream_to_channel:
@@ -295,17 +296,17 @@ class FrpsMultiProtocol:
         for listener in list(self.port_listeners.values()):
             await listener.stop()
         self.port_listeners.clear()
-        
+
         for listener in list(self.udp_listeners.values()):
             listener.stop()
         self.udp_listeners.clear()
-        
+
         for channel in self.data_channels:
             channel.close()
-        for writer in self.stream_to_user.values():
+        for writer in list(self.stream_to_user.values()):
             try:
                 writer.close()
-            except:
+            except Exception:
                 pass
         self.stream_to_user.clear()
         self.stream_to_channel.clear()
@@ -313,13 +314,13 @@ class FrpsMultiProtocol:
     
     async def _handle_register_port(self, data: bytes):
         port = struct.unpack('!I', data)[0]
-        
+
         if port in self.port_listeners:
             logger.info(f'Port {port} already registered')
             self.control_writer.write(struct.pack('!BII', CMD_REGISTER_PORT, 4, port))
             await self.control_writer.drain()
             return
-        
+
         try:
             listener = PortListener(port, self)
             server = await asyncio.start_server(
@@ -328,8 +329,8 @@ class FrpsMultiProtocol:
             )
             listener.server = server
             self.port_listeners[port] = listener
-            asyncio.create_task(server.serve_forever())
-            
+            listener.server_task = asyncio.create_task(server.serve_forever())
+
             self.control_writer.write(struct.pack('!BII', CMD_REGISTER_PORT, 4, port))
             await self.control_writer.drain()
         except Exception as e:
@@ -353,6 +354,7 @@ class PortListener:
         self.port = port
         self.protocol = protocol
         self.server = None
+        self.server_task = None
         self.next_conn_id = 1
     
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -399,8 +401,8 @@ class PortListener:
         if stream_id not in self.protocol.stream_ready:
             logger.warning(f'No ACK for stream {stream_id}')
             writer.close()
-            del self.protocol.stream_to_user[stream_id]
-            del self.protocol.stream_to_channel[stream_id]
+            self.protocol.stream_to_user.pop(stream_id, None)
+            self.protocol.stream_to_channel.pop(stream_id, None)
             return
         
         # Forward user data to client via assigned channel
@@ -435,13 +437,19 @@ class PortListener:
                 try:
                     self.protocol.control_writer.write(struct.pack('!BII', CMD_CLOSE_STREAM, 4, stream_id))
                     await self.protocol.control_writer.drain()
-                except:
+                except Exception:
                     pass
-            
+
             # Clean up all stream resources
             self.protocol._cleanup_stream(stream_id)
     
     async def stop(self):
+        if self.server_task:
+            self.server_task.cancel()
+            try:
+                await self.server_task
+            except asyncio.CancelledError:
+                pass
         if self.server:
             self.server.close()
             await self.server.wait_closed()
@@ -463,17 +471,18 @@ class UDPListener(asyncio.DatagramProtocol):
     def datagram_received(self, data, addr):
         """Receive UDP packet from local source, forward to client via TCP data channel."""
         # logger.debug(f'UDP Packet from {addr} on port {self.port}')
-        
+
         # Map source to a channel (round-robin)
         channel = self.protocol.get_next_channel()
         if not channel:
             return
-            
+
         # Frame: [Cmd:1][Length:4][Port:4][IPLen:1][IP:V][RemotePort:2][UDPData:N]
         ip = addr[0].encode()
         payload = struct.pack('!IB', self.port, len(ip)) + ip + struct.pack('!H', addr[1]) + data
-        
-        asyncio.create_task(channel.send_udp(payload))
+
+        task = asyncio.create_task(channel.send_udp(payload))
+        task.add_done_callback(lambda t: t.exception() if t.exception() else None)
     
     def send_to(self, addr, data):
         if self.transport:
@@ -482,6 +491,7 @@ class UDPListener(asyncio.DatagramProtocol):
     def stop(self):
         if self.transport:
             self.transport.close()
+            self.transport = None
 
 
 class FrpsMultiServer:
@@ -491,7 +501,7 @@ class FrpsMultiServer:
         self.host = host
         self.port = port
         self.num_data_channels = num_data_channels
-        self.active_clients: Dict[str, FrpsMultiProtocol] = {} # Key: Peer IP
+        self.active_clients: Dict[int, FrpsMultiProtocol] = {} # Key: Client ID
     
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info('peername')
@@ -511,41 +521,43 @@ class FrpsMultiServer:
         conn_type = struct.unpack('!B', conn_type_data)[0]
         
         if conn_type == CONN_CONTROL:
-            logger.info(f'Control connection from {addr}')
+            # Read client ID
+            client_id_data = await reader.readexactly(4)
+            client_id = struct.unpack('!I', client_id_data)[0]
+            logger.info(f'Control connection from {addr}, client_id={client_id}')
             protocol = FrpsMultiProtocol()
             protocol.control_reader = reader
             protocol.control_writer = writer
-            
+
             # Wait for data channels
             logger.info(f'Waiting for {self.num_data_channels} data channels...')
-            
+
             # Store protocol for data channel registration
-            client_ip = addr[0]
-            self.active_clients[client_ip] = protocol
-            
+            self.active_clients[client_id] = protocol
+
             # Start control handling immediately
             try:
                 await protocol.handle_control()
             finally:
-                if client_ip in self.active_clients:
-                    del self.active_clients[client_ip]
-            
+                self.active_clients.pop(client_id, None)
+
         elif conn_type == CONN_DATA:
-            # Read channel ID
+            # Read client ID and channel ID
+            client_id_data = await reader.readexactly(4)
+            client_id = struct.unpack('!I', client_id_data)[0]
             channel_id_data = await reader.readexactly(4)
             channel_id = struct.unpack('!I', channel_id_data)[0]
-            
-            client_ip = addr[0]
-            if client_ip in self.active_clients:
-                protocol = self.active_clients[client_ip]
+
+            if client_id in self.active_clients:
+                protocol = self.active_clients[client_id]
                 channel = DataChannel(reader, writer, channel_id)
                 protocol.data_channels.append(channel)
                 logger.info(f'Data channel {channel_id} connected from {addr}')
-                
+
                 # Start handling this channel
                 await protocol.handle_data_channel(channel)
             else:
-                logger.warning(f'Data channel from unknown client: {client_ip}')
+                logger.warning(f'Data channel from unknown client: {client_id}')
                 writer.close()
     
     async def start(self):
@@ -554,8 +566,11 @@ class FrpsMultiServer:
             limit=16 * 1024 * 1024
         )
         
-        addr = server.sockets[0].getsockname()
-        logger.info(f'FRPS Multi-Connection Server on {addr}')
+        if server.sockets:
+            addr = server.sockets[0].getsockname()
+            logger.info(f'FRPS Multi-Connection Server on {addr}')
+        else:
+            logger.info(f'FRPS Multi-Connection Server on {self.host}:{self.port}')
         logger.info(f'Expecting {self.num_data_channels} data channels per client')
         
         async with server:

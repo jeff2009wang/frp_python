@@ -3,13 +3,13 @@
 FRPC Multi-Connection Client - Parallel TCP Transport for Maximum Throughput
 """
 import sys
+import os
 import socket
 import struct
 import logging
 import asyncio
 import time
 import threading
-import heapq
 from typing import Dict, Optional, Set, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -225,8 +225,10 @@ class FrpcMultiProtocol:
         self.registered_ports: Set[int] = set()
         self.active_streams: Dict[int, asyncio.StreamWriter] = {}
         self.stream_to_channel: Dict[int, DataChannel] = {}
+        self.udp_clients: Dict = {}
         self._running = True
         self._channel_index = 0
+        self._tasks: Set[asyncio.Task] = set()
     
     def get_next_channel(self) -> DataChannel:
         """Round-robin channel selection."""
@@ -326,19 +328,23 @@ class FrpcMultiProtocol:
     async def _handle_udp_data(self, data: bytes):
         """Receive UDP data from server and send to local target."""
         # Frame: [Port:4][IPLen:1][IP:V][RemotePort:2][UDPData:N]
+        if len(data) < 7:
+            logger.warning(f'UDP data too short: {len(data)} bytes')
+            return
         port = struct.unpack('!I', data[:4])[0]
         ip_len = data[4]
+        if len(data) < 7 + ip_len:
+            logger.warning(f'UDP data truncated: expected {7 + ip_len} bytes, got {len(data)}')
+            return
         ip = data[5:5+ip_len].decode()
         remote_port = struct.unpack('!H', data[5+ip_len:7+ip_len])[0]
         udp_content = data[7+ip_len:]
-        
-        # In a real scenario, we might want to map (Port, IP, RemotePort) to a local UDP socket
-        # To keep it simple, we just send to the local target port for this system.
-        # But we need to keep track of where to send the response back.
-        
-        if not hasattr(self, 'udp_clients'):
-            self.udp_clients = {} # (TargetPort, ServerRemoteIP, ServerRemotePort) -> local_transport
-            
+
+        # Limit UDP sessions to prevent memory exhaustion
+        if len(self.udp_clients) >= 1000:
+            logger.warning('UDP client limit reached, dropping packet')
+            return
+
         key = (port, ip, remote_port)
         if key not in self.udp_clients:
             try:
@@ -356,9 +362,12 @@ class FrpcMultiProtocol:
             except Exception as e:
                 logger.error(f'Failed to create local UDP client: {e}')
                 return
-        
+
         entry = self.udp_clients[key]
-        entry['transport'].sendto(udp_content)
+        try:
+            entry['transport'].sendto(udp_content)
+        except Exception as e:
+            logger.error(f'Failed to send UDP data: {e}')
         entry['last_activity'] = time.time()
     
     def adjust_network_mode(self, is_weak: bool):
@@ -382,7 +391,7 @@ class FrpcMultiProtocol:
         if stream_id in self.active_streams:
             try:
                 self.active_streams[stream_id].close()
-            except:
+            except Exception:
                 pass
             del self.active_streams[stream_id]
         if stream_id in self.stream_to_channel:
@@ -393,13 +402,19 @@ class FrpcMultiProtocol:
         self._running = False
         for channel in self.data_channels:
             channel.close()
-        for writer in self.active_streams.values():
+        for writer in list(self.active_streams.values()):
             try:
                 writer.close()
-            except:
+            except Exception:
+                pass
+        for entry in self.udp_clients.values():
+            try:
+                entry['transport'].close()
+            except Exception:
                 pass
         self.active_streams.clear()
         self.stream_to_channel.clear()
+        self.udp_clients.clear()
     
     async def register_port(self, port: int):
         """Register a TCP port."""
@@ -455,7 +470,7 @@ class FrpcMultiProtocol:
             await self.control_writer.drain()
             
             # Forward local data to server
-            asyncio.create_task(self._forward_to_server(reader, stream_id, channel))
+            self._create_task(self._forward_to_server(reader, stream_id, channel), name=f'forward_{stream_id}')
             
         except Exception as e:
             logger.error(f'Connection failed for port {port}: {e}')
@@ -493,9 +508,9 @@ class FrpcMultiProtocol:
                 try:
                     self.control_writer.write(struct.pack('!BII', CMD_CLOSE_STREAM, 4, stream_id))
                     # Note: We don't await drain here to avoid blocking cleanup if control is congested
-                except:
+                except Exception:
                     pass
-            
+
             # Clean up all stream resources
             self._cleanup_stream(stream_id)
 
@@ -517,14 +532,15 @@ class PortScanner:
         self.last_full_scan_time = 0
     
     def check_port(self, host: str, port: int, timeout: float = 0.3) -> bool:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
             result = sock.connect_ex((host, port))
-            sock.close()
             return result == 0
-        except:
+        except Exception:
             return False
+        finally:
+            sock.close()
     
     def scan_ports_fast(self, host: str = '127.0.0.1', ports: Optional[List[int]] = None) -> List[int]:
         if ports is None:
@@ -598,7 +614,7 @@ class PortScanner:
 
 class FrpcMultiClient:
     """Multi-connection FRP Client."""
-    
+
     def __init__(self, server_host: str, server_port: int, target_host: str = '127.0.0.1',
                  num_channels: int = 12, scan_interval: int = 20, ports: Optional[List[int]] = None,
                  udp_ports: Optional[List[int]] = None):
@@ -608,11 +624,12 @@ class FrpcMultiClient:
         self.num_channels = num_channels
         self.udp_ports = udp_ports or []
         self.running = True
-        
+        self.client_id = struct.unpack('!I', os.urandom(4))[0]
+
         self.protocol: Optional[FrpcMultiProtocol] = None
         self.port_change_queue: List[tuple] = []
         self.port_change_lock = threading.Lock()
-        
+
         self.scanner = PortScanner(scan_interval, ports, 50)
         self.scanner.on_port_change = self.on_port_change
     
@@ -628,54 +645,61 @@ class FrpcMultiClient:
         await loop.sock_connect(sock, (host, port))
         return sock
 
+    def _create_task(self, coro, name: str = None) -> asyncio.Task:
+        """Create a tracked asyncio task."""
+        task = asyncio.create_task(coro, name=name)
+        self.protocol._tasks.add(task)
+        task.add_done_callback(lambda t: self.protocol._tasks.discard(t))
+        return task
+
     async def connect(self):
         logger.info(f'Connecting to {self.server_host}:{self.server_port}')
-        
+
         # Create protocol
         self.protocol = FrpcMultiProtocol(self.target_host)
-        
+
         # Connect control channel
         sock = await self._create_optimized_socket(self.server_host, self.server_port)
         reader, writer = await asyncio.open_connection(sock=sock)
         # self._optimize_socket(writer) # Already optimized via pre-creation
         writer.transport.set_write_buffer_limits(high=16 * 1024 * 1024)
-        
-        writer.write(struct.pack('!B', CONN_CONTROL))
+
+        writer.write(struct.pack('!BI', CONN_CONTROL, self.client_id))
         await writer.drain()
-        
+
         self.protocol.control_reader = reader
         self.protocol.control_writer = writer
         logger.info('Control channel connected')
-        
+
         # Connect data channels
         for i in range(self.num_channels):
             sock = await self._create_optimized_socket(self.server_host, self.server_port)
             dr, dw = await asyncio.open_connection(sock=sock)
             # self._optimize_socket(dw) # Already optimized
             dw.transport.set_write_buffer_limits(high=16 * 1024 * 1024)
-            
-            dw.write(struct.pack('!BI', CONN_DATA, i))
+
+            dw.write(struct.pack('!BII', CONN_DATA, self.client_id, i))
             # No drain needed for small packet
-            
+
             channel = DataChannel(dr, dw, i)
             self.protocol.data_channels.append(channel)
-            asyncio.create_task(self.protocol.handle_data_channel(channel))
+            self._create_task(self.protocol.handle_data_channel(channel), name=f'data_channel_{i}')
             logger.info(f'Data channel {i} connected')
-        
+
         logger.info(f'All {self.num_channels} data channels ready')
-        
+
         # Start tasks
-        asyncio.create_task(self._heartbeat_loop())
-        asyncio.create_task(self._port_monitor_loop())
-        asyncio.create_task(self._process_port_changes())
-        asyncio.create_task(self._udp_cleanup_loop())
-        
+        self._create_task(self._heartbeat_loop(), name='heartbeat')
+        self._create_task(self._port_monitor_loop(), name='port_monitor')
+        self._create_task(self._process_port_changes(), name='port_changes')
+        self._create_task(self._udp_cleanup_loop(), name='udp_cleanup')
+
         # Initial UDP registration
-        if hasattr(self, 'udp_ports') and self.udp_ports:
+        if self.udp_ports:
             logger.info(f'Registering UDP ports: {", ".join(map(str, self.udp_ports))}')
             for port in self.udp_ports:
                 await self.protocol.register_udp_port(port)
-        
+
         await self.protocol.handle_control()
     
     def _optimize_socket(self, writer):
@@ -691,16 +715,19 @@ class FrpcMultiClient:
     async def _heartbeat_loop(self):
         while self.running and self.protocol:
             try:
+                if not self.protocol or not self.protocol.control_writer or self.protocol.control_writer.is_closing():
+                    break
                 # Send heartbeat with timestamp
                 payload = struct.pack('!d', time.time())
                 self.protocol.control_writer.write(struct.pack('!BI', CMD_HEARTBEAT, len(payload)) + payload)
                 await self.protocol.control_writer.drain()
                 await asyncio.sleep(2) # Faster heartbeat for monitoring
-            except:
+            except Exception:
                 break
     
     async def _port_monitor_loop(self):
-        await asyncio.get_event_loop().run_in_executor(
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
             None, self.scanner.start_continuous_scan, self.target_host
         )
     
