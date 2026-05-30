@@ -29,6 +29,7 @@ class BatchSender:
         self._drain_threshold = drain_threshold
         self._drain_interval_ms = drain_interval_ms
         self._flush_task = None
+        self._flush_pending = False
 
     def start(self) -> None:
         """Start the periodic background flush task."""
@@ -48,9 +49,9 @@ class BatchSender:
         if self._closed:
             raise RuntimeError("BatchSender is closed")
         self._buffer.extend(data)
-        # Trigger maybe_flush in the background if threshold exceeded
+        # Signal that a flush is needed; periodic task will pick it up
         if len(self._buffer) >= self._drain_threshold:
-            asyncio.create_task(self.maybe_flush())
+            self._flush_pending = True
 
     async def flush(self) -> None:
         """Flush all buffered data to the writer and await drain()."""
@@ -66,11 +67,12 @@ class BatchSender:
             await self.flush()
 
     async def _periodic_flush(self) -> None:
-        """Background task that flushes at regular intervals."""
+        """Background task that flushes at regular intervals or when signaled."""
         try:
             while not self._closed:
                 await asyncio.sleep(self._drain_interval_ms / 1000.0)
-                if self._buffer:
+                if self._flush_pending or self._buffer:
+                    self._flush_pending = False
                     await self.flush()
         except asyncio.CancelledError:
             # Graceful exit on cancellation

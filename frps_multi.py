@@ -195,7 +195,7 @@ class FrpsMultiProtocol:
                     logger.info(f'Stream {stream_id} ready')
                 elif cmd == CMD_ENABLE_MULTI_CHANNEL:
                     stream_id = struct.unpack('!I', data)[0]
-                    self.flow_classifier.stream_mode[str(stream_id)] = FlowClassifier.MODE_MULTI
+                    self.flow_classifier.set_mode(str(stream_id), FlowClassifier.MODE_MULTI)
                     self.control_writer.write(
                         struct.pack('!BII', CMD_MULTI_CHANNEL_ACK, 4, stream_id)
                     )
@@ -453,8 +453,9 @@ class PortListener:
                 perf_stats.add_recv(len(data))
 
                 # Classify and route
+                now = time.time()
                 self.protocol.flow_classifier.record_bytes(
-                    str(stream_id), len(data), time.time()
+                    str(stream_id), len(data), now
                 )
 
                 t2 = time.time()
@@ -466,14 +467,14 @@ class PortListener:
                         ch = self.protocol.data_channels[ch_idx]
                         if ch.active:
                             self.protocol.channel_monitor.record_sent(
-                                channel_id, len(chunk), time.time()
+                                channel_id, len(chunk), now
                             )
                             await ch.send(stream_id, seq, chunk)
                 else:
                     # Single-channel: use assigned channel
                     await channel.send_single(stream_id, data)
                     self.protocol.channel_monitor.record_sent(
-                        str(channel.channel_id), len(data), time.time()
+                        str(channel.channel_id), len(data), now
                     )
 
                 t3 = time.time()

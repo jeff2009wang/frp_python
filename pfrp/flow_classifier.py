@@ -1,5 +1,6 @@
 """FlowClassifier: decides single-channel vs multi-channel mode per stream."""
 
+from collections import deque
 import time
 from typing import Dict, List, Tuple
 
@@ -27,6 +28,16 @@ class FlowClassifier:
         # stream_id -> dict with state
         self._streams: Dict[str, dict] = {}
 
+    def set_mode(self, stream_id: str, mode: int) -> None:
+        """Set the mode for a stream.
+
+        Args:
+            stream_id: Unique identifier for the stream.
+            mode: MODE_SINGLE or MODE_MULTI.
+        """
+        state = self._get_stream_state(stream_id)
+        state['mode'] = mode
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -49,7 +60,7 @@ class FlowClassifier:
             self._streams[stream_id] = {
                 "mode": self.MODE_SINGLE,
                 "total_bytes": 0,
-                "samples": [],  # list of (timestamp, bytes_count)
+                "samples": deque(),  # (timestamp, bytes_count)
             }
         return self._streams[stream_id]
 
@@ -64,15 +75,16 @@ class FlowClassifier:
         if not samples:
             return False
 
-        # Only consider samples within the promotion window
+        # Trim old samples outside the window (amortized O(1) with deque)
         window_start = timestamp - FLOW_PROMOTION_WINDOW
-        window_samples = [(ts, bc) for ts, bc in samples if ts >= window_start]
+        while samples and samples[0][0] < window_start:
+            samples.popleft()
 
-        if not window_samples:
+        if not samples:
             return False
 
-        total_bytes_in_window = sum(bc for _, bc in window_samples)
-        window_duration = max(window_samples[-1][0] - window_samples[0][0], 1e-9)
+        total_bytes_in_window = sum(bc for _, bc in samples)
+        window_duration = max(samples[-1][0] - samples[0][0], 1e-9)
         rate = total_bytes_in_window / window_duration
 
         return rate >= self._get_rate_threshold()
@@ -97,10 +109,6 @@ class FlowClassifier:
 
         state["total_bytes"] += bytes_count
         state["samples"].append((timestamp, bytes_count))
-
-        # Trim old samples outside the promotion window to avoid unbounded growth
-        window_start = timestamp - FLOW_PROMOTION_WINDOW
-        state["samples"] = [(ts, bc) for ts, bc in state["samples"] if ts >= window_start]
 
         if self._check_promotion(state, timestamp):
             state["mode"] = self.MODE_MULTI
